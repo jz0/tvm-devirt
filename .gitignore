@@ -1,0 +1,14 @@
+/target
+
+# Test binaries
+*.sys
+*.dll
+
+# IDA databases
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til

@@ -1,0 +1,16 @@
+[package]
+name = "tvm-devirt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.5", features = ["derive"] }
+iced-x86 = { version = "1.21", features = ["code_asm"] }
+rayon = "1.12.0"
+
+[profile.release]
+debug = true
+
+[profile.dev]
+opt-level = 1
