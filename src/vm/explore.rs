@@ -22,7 +22,6 @@ struct Task<'a> {
     ancestors: Vec<BlockId>,
 }
 
-
 /// Run a block while keeping its entry parameters valid across arena compaction.
 fn run_retaining_entry_params(
     emu: &mut Emulator<'_>,
@@ -197,12 +196,14 @@ impl<'a> Explorer<'a> {
         let mut timed_out = false;
         let mut unresolved = 0usize;
 
+        let deadline = crate::ir::lift::RecoveryDeadline::starting_now(self.time_budget);
         let mut queue: Vec<Task> = vec![Task {
             emu: {
                 let mut e = Emulator::with_vm_section(self.pe, self.stack_base, &self.vm_section);
                 // Forks clone the evaluator, so setting this on the seed reaches every
                 // block in the pass.
                 e.vip_slot = vip_slot;
+                e.deadline = Some(deadline);
                 e
             },
             resume: start,
@@ -211,14 +212,12 @@ impl<'a> Explorer<'a> {
             ancestors: Vec::new(),
         }];
 
-        let deadline = std::time::Instant::now() + self.time_budget;
-
         while let Some(mut task) = queue.pop() {
             // The work budget is the deterministic limit and should be the one that
             // fires. If the timer wins the race the result depends on machine load,
             // so say so rather than silently emitting different code than last run.
             let out_of_work = total_steps >= self.work_budget;
-            let out_of_time = std::time::Instant::now() >= deadline;
+            let out_of_time = deadline.expired();
             if out_of_time && !out_of_work {
                 timed_out = true;
             }
@@ -388,6 +387,12 @@ impl<'a> Explorer<'a> {
                 Stop::Budget { site } => Terminator::Unresolved {
                     reason: format!("budget exhausted at {site:#x}"),
                 },
+                Stop::Deadline { .. } => {
+                    timed_out = true;
+                    Terminator::Unresolved {
+                        reason: "time budget reached".into(),
+                    }
+                }
                 Stop::OutOfImage { site } => Terminator::Unresolved {
                     reason: format!("left image at {site:#x}"),
                 },
