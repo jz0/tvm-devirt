@@ -694,7 +694,13 @@ impl<'a> Emulator<'a> {
             if rsp_ok && score >= MIN_CONTEXT_SCORE && best.is_none_or(|(b, _)| score > b) {
                 best = Some((score, base));
             }
-            base += 8;
+            // `hi` saturates at the top of the address space. Stop when advancing
+            // the aligned probe would wrap to zero instead of scanning from the
+            // bottom of the address space indefinitely.
+            let Some(next) = base.checked_add(8) else {
+                break;
+            };
+            base = next;
         }
         if best.is_none() {
             self.ctx_miss = Some((any_rsp, best_rsp_only));
