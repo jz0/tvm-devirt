@@ -40,6 +40,9 @@ pub fn describe_stop(emu: &lift::Emulator, stop: &lift::Stop) -> String {
             format!("loop back edge at {site:#x} -> {target:#x}")
         }
         lift::Stop::Budget { site } => format!("step budget exhausted at {site:#x}"),
+        lift::Stop::Deadline { site } => {
+            format!("recovery wall clock ran out inside the block at {site:#x}")
+        }
         lift::Stop::Diverged { site, nodes } => {
             format!("folding diverged at {site:#x} ({nodes} DAG nodes)")
         }

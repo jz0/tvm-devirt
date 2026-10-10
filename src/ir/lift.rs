@@ -289,6 +289,8 @@ pub enum Stop {
     },
     /// Step budget exhausted.
     Budget { site: u64 },
+    /// The recovery wall clock ran out inside this block.
+    Deadline { site: u64 },
     /// The expression DAG grew past its limit, which means folding has broken
     /// down and further evaluation would only produce garbage.
     Diverged { site: u64, nodes: usize },
@@ -382,7 +384,32 @@ pub struct Emulator<'a> {
     /// the base, since the two are only meaningful together.
     pub guest_layout: Option<Layout>,
     pub vip_slot: Option<u64>,
+    /// Wall-clock limit shared by every evaluator fork in one recovery pass.
+    pub deadline: Option<RecoveryDeadline>,
 }
+
+/// A wall-clock limit shared by every fork of one recovery pass.
+#[derive(Clone, Copy, Debug)]
+pub struct RecoveryDeadline {
+    started: std::time::Instant,
+    budget: std::time::Duration,
+}
+
+impl RecoveryDeadline {
+    pub fn starting_now(budget: std::time::Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            budget,
+        }
+    }
+
+    pub fn expired(&self) -> bool {
+        self.started.elapsed() >= self.budget
+    }
+}
+
+/// Instructions between wall-clock checks inside the evaluator loop.
+const DEADLINE_CHECK_INTERVAL: usize = 4096;
 
 /// Recursive expression analyses still used by instruction folding must remain
 /// comfortably inside the 1 MiB Windows main-thread stack after compaction.
@@ -439,6 +466,7 @@ impl<'a> Emulator<'a> {
             // a wrong constant would degenerate `(handler, vip)` to `handler` and
             // close back edges that do not exist.
             vip_slot: None,
+            deadline: None,
             noreturn_slots: noreturn_import_slots(pe),
             import_slots: pe.imports().into_iter().map(|(slot, _, _)| slot).collect(),
         }
@@ -666,7 +694,13 @@ impl<'a> Emulator<'a> {
             if rsp_ok && score >= MIN_CONTEXT_SCORE && best.is_none_or(|(b, _)| score > b) {
                 best = Some((score, base));
             }
-            base += 8;
+            // `hi` saturates at the top of the address space. Stop when advancing
+            // the aligned probe would wrap to zero instead of scanning from the
+            // bottom of the address space indefinitely.
+            let Some(next) = base.checked_add(8) else {
+                break;
+            };
+            base = next;
         }
         if best.is_none() {
             self.ctx_miss = Some((any_rsp, best_rsp_only));
@@ -1042,7 +1076,8 @@ impl<'a> Emulator<'a> {
                 // Not a discriminator for this address after all.
                 continue;
             }
-            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width)) else {
+            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width))
+            else {
                 continue;
             };
             let v = self.arena.select(cand, v1, v0);
@@ -2609,7 +2644,12 @@ impl<'a> Emulator<'a> {
         retained: &mut [Ref],
     ) -> Stop {
         let mut ip = start;
-        for _ in 0..budget {
+        for i in 0..budget {
+            if i % DEADLINE_CHECK_INTERVAL == 0
+                && self.deadline.is_some_and(|deadline| deadline.expired())
+            {
+                return Stop::Deadline { site: ip };
+            }
             if self.pe.section_for_va(ip).is_none() {
                 return Stop::OutOfImage { site: ip };
             }
@@ -3242,6 +3282,92 @@ mod compaction_tests {
 }
 
 #[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::binary::pe::{PeFile, Section};
+    use std::time::Duration;
+
+    const IMAGE_BASE: u64 = 0x0001_4000_0000;
+    const START: u64 = IMAGE_BASE + 0x1000;
+
+    fn pe_with(code: &[u8]) -> PeFile {
+        let mut data = vec![0u8; 0x400];
+        data[0x200..0x200 + code.len()].copy_from_slice(code);
+        PeFile {
+            data,
+            image_base: IMAGE_BASE,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: ".text".into(),
+                virtual_address: 0x1000,
+                virtual_size: 0x100,
+                raw_address: 0x200,
+                raw_size: 0x100,
+                characteristics: 0x2000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    const SPIN: &[u8] = &[0xeb, 0xfe];
+
+    #[test]
+    fn a_block_that_spins_aborts_at_the_deadline_instead_of_running_out_its_steps() {
+        let pe = pe_with(SPIN);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        const STEPS: usize = 200_000_000;
+        emu.deadline = Some(RecoveryDeadline::starting_now(Duration::from_millis(50)));
+
+        let started = std::time::Instant::now();
+        let stop = emu.run(START, STEPS);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(stop, Stop::Deadline { site } if site == START));
+        assert!(emu.steps < STEPS, "the step budget ended the block");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "deadline overshot by {elapsed:?}"
+        );
+        assert!(elapsed >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn without_a_deadline_the_step_budget_is_the_only_limit() {
+        let pe = pe_with(SPIN);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        assert!(emu.deadline.is_none());
+        assert!(matches!(emu.run(START, 64), Stop::Budget { site } if site == START));
+        assert_eq!(emu.steps, 64);
+    }
+
+    #[test]
+    fn a_generous_deadline_leaves_a_short_blocks_result_unchanged() {
+        let pe = pe_with(&[0xc3]);
+        let mut plain = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let mut clocked = Emulator::new(&pe, 0x7fff_ffff_0000);
+        clocked.deadline = Some(RecoveryDeadline::starting_now(Duration::from_secs(600)));
+
+        let (Stop::Return { site: a, dest: da }, Stop::Return { site: b, dest: db }) =
+            (plain.run(START, 1), clocked.run(START, 1))
+        else {
+            panic!("a short block changed under a generous deadline")
+        };
+        assert_eq!(a, b);
+        assert_eq!(plain.steps, clocked.steps);
+        assert_eq!(
+            plain.arena.structural_hash(da, 8),
+            clocked.arena.structural_hash(db, 8)
+        );
+    }
+}
+
+#[cfg(test)]
 mod vip_slot_tests {
     use super::*;
 
@@ -3455,7 +3581,6 @@ mod predicate_split_tests {
         assert_eq!(a.as_const(folded), Some(0x1400_0a01_d2));
     }
 }
-
 
 #[cfg(test)]
 mod segment_tests {
