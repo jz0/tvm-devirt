@@ -1197,11 +1197,25 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
         _ => None,
     };
 
-    // A register still holding a `call_ret` opaque needs no code: that opaque was minted by `clobber_call` to stand for "whatever the callee left here", and the `call` instruction emitted above already establishes exactly that.
+    // Results defined by this block's calls must stay live until their exit
+    // uses: later instructions and boundary moves may overwrite RAX. Incoming
+    // call_ret values need explicit cross-block provenance before they can use
+    // this path; value() otherwise guesses that they arrived in entry RAX.
+    let local_call_results: HashSet<Ref> = b
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Call { ret, .. } => *ret,
+            _ => None,
+        })
+        .collect();
     let mut exits = Vec::new();
     let mut callee_set = Vec::new();
     for (reg, v) in &b.exit_regs {
-        if matches!(cfg.arena.op(*v), Op::Opaque("call_ret" | "clobbered", _)) {
+        if matches!(cfg.arena.op(*v), Op::Opaque("clobbered", _))
+            || (matches!(cfg.arena.op(*v), Op::Opaque("call_ret", _))
+                && !local_call_results.contains(v))
+        {
             callee_set.push(*reg);
         } else {
             exits.push((*reg, s.value(*v)));
